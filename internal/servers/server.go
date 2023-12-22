@@ -11,13 +11,13 @@ import (
 	"time"
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/ratelimit"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/rs/cors"
 
 	grpcAuth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
 
 	grpcRecovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
 	grpcValidator "github.com/grpc-ecosystem/go-grpc-middleware/validator"
-	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	"github.com/rs/cors"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc"
@@ -104,9 +104,7 @@ func (s *Container) Run(
 	authentication *config.Authn,
 	profiler *config.Profiler,
 	localInvoker invoke.Invoker,
-) error {
-	var err error
-
+) (err error) {
 	limiter := middleware.NewRateLimiter(srv.RateLimit) // for example 1000 req/sec
 
 	unaryInterceptors := []grpc.UnaryServerInterceptor{
@@ -152,12 +150,12 @@ func (s *Container) Run(
 	}
 
 	if srv.GRPC.TLSConfig.Enabled {
-		var c credentials.TransportCredentials
-		c, err = credentials.NewServerTLSFromFile(srv.GRPC.TLSConfig.CertPath, srv.GRPC.TLSConfig.KeyPath)
+		var creds credentials.TransportCredentials
+		creds, err = credentials.NewServerTLSFromFile(srv.GRPC.TLSConfig.CertPath, srv.GRPC.TLSConfig.KeyPath)
 		if err != nil {
 			return err
 		}
-		opts = append(opts, grpc.Creds(c))
+		opts = append(opts, grpc.Creds(creds))
 	}
 
 	// Create a new gRPC server instance with the provided options.
@@ -185,36 +183,7 @@ func (s *Container) Run(
 
 	// If profiling is enabled, set up the profiler using the net/http package.
 	if profiler.Enabled {
-		// Create a new HTTP ServeMux to register pprof routes.
-		mux := http.NewServeMux()
-		mux.HandleFunc("/debug/pprof/", pprof.Index)
-		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-
-		// Run the profiler server in a separate goroutine.
-		go func() {
-			// Log a message indicating the profiler server's start status and port.
-			slog.Info(fmt.Sprintf("🚀 profiler server successfully started: %s", profiler.Port))
-
-			// Define the HTTP server with timeouts and the mux handler for pprof routes.
-			pprofserver := &http.Server{
-				Addr:         ":" + profiler.Port,
-				Handler:      mux,
-				ReadTimeout:  20 * time.Second,
-				WriteTimeout: 20 * time.Second,
-				IdleTimeout:  15 * time.Second,
-			}
-
-			// Start the profiler server.
-			if err := pprofserver.ListenAndServe(); err != nil {
-				// Check if the error was due to the server being closed, and log it.
-				if errors.Is(err, http.ErrServerClosed) {
-					slog.Error("failed to start profiler", err)
-				}
-			}
-		}()
+		startProfiler(profiler)
 	}
 
 	var lis net.Listener
@@ -235,14 +204,13 @@ func (s *Container) Run(
 			slog.Error("failed to start grpc server", err)
 		}
 	}()
+	slog.Info(fmt.Sprintf("🚀 grpc server successfully started: %s", srv.GRPC.Port))
 
 	go func() {
 		if err := invokeServer.Serve(invokeLis); err != nil {
 			slog.Error("failed to start invoke grpc server", err)
 		}
 	}()
-
-	slog.Info(fmt.Sprintf("🚀 grpc server successfully started: %s", srv.GRPC.Port))
 	slog.Info(fmt.Sprintf("🚀 invoker grpc server successfully started: %s", dst.Port))
 
 	var httpServer *http.Server
@@ -250,95 +218,18 @@ func (s *Container) Run(
 	// Start the optional HTTP server with CORS and optional TLS configurations.
 	// Connect to the gRPC server and register the HTTP handlers for each service.
 	if srv.HTTP.Enabled {
-		options := []grpc.DialOption{
-			grpc.WithBlock(),
-			grpc.WithUnaryInterceptor(otelgrpc.UnaryClientInterceptor()),
-		}
-		if srv.GRPC.TLSConfig.Enabled {
-			c, err := credentials.NewClientTLSFromFile(srv.GRPC.TLSConfig.CertPath, "")
-			if err != nil {
-				return err
-			}
-			options = append(options, grpc.WithTransportCredentials(c))
-		} else {
-			options = append(options, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		}
+		var conn *grpc.ClientConn
 
-		timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-
-		conn, err := grpc.DialContext(timeoutCtx, ":"+srv.GRPC.Port, options...)
+		httpServer, conn, err = startHTTPServer(ctx, srv)
 		if err != nil {
 			return err
 		}
+
 		defer func() {
 			if err = conn.Close(); err != nil {
 				slog.Error("Failed to close gRPC connection: %v", err)
 			}
 		}()
-
-		healthClient := health.NewHealthClient(conn)
-		muxOpts := []runtime.ServeMuxOption{
-			runtime.WithHealthzEndpoint(healthClient),
-			runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.HTTPBodyMarshaler{
-				Marshaler: &runtime.JSONPb{
-					MarshalOptions: protojson.MarshalOptions{
-						UseProtoNames:   true,
-						EmitUnpopulated: true,
-					},
-					UnmarshalOptions: protojson.UnmarshalOptions{
-						DiscardUnknown: true,
-					},
-				},
-			}),
-		}
-
-		mux := runtime.NewServeMux(muxOpts...)
-
-		if err = grpcV1.RegisterPermissionHandler(ctx, mux, conn); err != nil {
-			return err
-		}
-		if err = grpcV1.RegisterSchemaHandler(ctx, mux, conn); err != nil {
-			return err
-		}
-		if err = grpcV1.RegisterDataHandler(ctx, mux, conn); err != nil {
-			return err
-		}
-		if err = grpcV1.RegisterBundleHandler(ctx, mux, conn); err != nil {
-			return err
-		}
-		if err = grpcV1.RegisterTenancyHandler(ctx, mux, conn); err != nil {
-			return err
-		}
-
-		httpServer = &http.Server{
-			Addr: ":" + srv.HTTP.Port,
-			Handler: cors.New(cors.Options{
-				AllowCredentials: true,
-				AllowedOrigins:   srv.HTTP.CORSAllowedOrigins,
-				AllowedHeaders:   srv.HTTP.CORSAllowedHeaders,
-				AllowedMethods: []string{
-					http.MethodGet, http.MethodPost,
-					http.MethodHead, http.MethodPatch, http.MethodDelete, http.MethodPut,
-				},
-			}).Handler(mux),
-			ReadHeaderTimeout: 5 * time.Second,
-		}
-
-		// Start the HTTP server with TLS if enabled, otherwise without TLS.
-		go func() {
-			var err error
-			if srv.HTTP.TLSConfig.Enabled {
-				err = httpServer.ListenAndServeTLS(srv.HTTP.TLSConfig.CertPath, srv.HTTP.TLSConfig.KeyPath)
-			} else {
-				err = httpServer.ListenAndServe()
-			}
-			if !errors.Is(err, http.ErrServerClosed) {
-				slog.Error(err.Error())
-			}
-		}()
-
-		slog.Info(fmt.Sprintf("🚀 http server successfully started: %s", srv.HTTP.Port))
 	}
 
 	// Wait for the context to be canceled (e.g., due to a signal).
@@ -347,6 +238,8 @@ func (s *Container) Run(
 	// Shutdown the servers gracefully.
 	ctxShutdown, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+
+	slog.Info("gracefully shutting down...")
 
 	if httpServer != nil {
 		if err := httpServer.Shutdown(ctxShutdown); err != nil {
@@ -360,7 +253,128 @@ func (s *Container) Run(
 	// Gracefully stop the invoke server.
 	invokeServer.GracefulStop()
 
-	slog.Info("gracefully shutting down")
-
 	return nil
+}
+
+func startProfiler(profiler *config.Profiler) {
+	// Create a new HTTP ServeMux to register pprof routes.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	// Run the profiler server in a separate goroutine.
+	go func() {
+		// Log a message indicating the profiler server's start status and port.
+		slog.Info(fmt.Sprintf("🚀 profiler server successfully started: %s", profiler.Port))
+
+		// Define the HTTP server with timeouts and the mux handler for pprof routes.
+		pprofserver := &http.Server{
+			Addr:         ":" + profiler.Port,
+			Handler:      mux,
+			ReadTimeout:  20 * time.Second,
+			WriteTimeout: 20 * time.Second,
+			IdleTimeout:  15 * time.Second,
+		}
+
+		// Start the profiler server.
+		if err := pprofserver.ListenAndServe(); err != nil {
+			// Check if the error was due to the server being closed, and log it.
+			if errors.Is(err, http.ErrServerClosed) {
+				slog.Error("failed to start profiler", err)
+			}
+		}
+	}()
+}
+
+func startHTTPServer(ctx context.Context, srv *config.Server) (*http.Server, *grpc.ClientConn, error) {
+	options := []grpc.DialOption{
+		grpc.WithBlock(),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+	}
+
+	if srv.GRPC.TLSConfig.Enabled {
+		c, err := credentials.NewClientTLSFromFile(srv.GRPC.TLSConfig.CertPath, "")
+		if err != nil {
+			return nil, nil, err
+		}
+		options = append(options, grpc.WithTransportCredentials(c))
+	} else {
+		options = append(options, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	conn, err := grpc.DialContext(timeoutCtx, ":"+srv.GRPC.Port, options...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	healthClient := health.NewHealthClient(conn)
+	muxOpts := []runtime.ServeMuxOption{
+		runtime.WithHealthzEndpoint(healthClient),
+		runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.HTTPBodyMarshaler{
+			Marshaler: &runtime.JSONPb{
+				MarshalOptions: protojson.MarshalOptions{
+					UseProtoNames:   true,
+					EmitUnpopulated: true,
+				},
+				UnmarshalOptions: protojson.UnmarshalOptions{
+					DiscardUnknown: true,
+				},
+			},
+		}),
+	}
+
+	mux := runtime.NewServeMux(muxOpts...)
+
+	if err = grpcV1.RegisterPermissionHandler(ctx, mux, conn); err != nil {
+		return nil, nil, err
+	}
+	if err = grpcV1.RegisterSchemaHandler(ctx, mux, conn); err != nil {
+		return nil, nil, err
+	}
+	if err = grpcV1.RegisterDataHandler(ctx, mux, conn); err != nil {
+		return nil, nil, err
+	}
+	if err = grpcV1.RegisterBundleHandler(ctx, mux, conn); err != nil {
+		return nil, nil, err
+	}
+	if err = grpcV1.RegisterTenancyHandler(ctx, mux, conn); err != nil {
+		return nil, nil, err
+	}
+
+	httpServer := http.Server{
+		Addr: ":" + srv.HTTP.Port,
+		Handler: cors.New(cors.Options{
+			AllowCredentials: true,
+			AllowedOrigins:   srv.HTTP.CORSAllowedOrigins,
+			AllowedHeaders:   srv.HTTP.CORSAllowedHeaders,
+			AllowedMethods: []string{
+				http.MethodGet, http.MethodPost,
+				http.MethodHead, http.MethodPatch, http.MethodDelete, http.MethodPut,
+			},
+		}).Handler(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	// Start the HTTP server with TLS if enabled, otherwise without TLS.
+	go func() {
+		var err error
+		if srv.HTTP.TLSConfig.Enabled {
+			err = httpServer.ListenAndServeTLS(srv.HTTP.TLSConfig.CertPath, srv.HTTP.TLSConfig.KeyPath)
+		} else {
+			err = httpServer.ListenAndServe()
+		}
+		if !errors.Is(err, http.ErrServerClosed) {
+			slog.Error(err.Error())
+		}
+	}()
+
+	slog.Info(fmt.Sprintf("🚀 http server successfully started: %s", srv.HTTP.Port))
+
+	return &httpServer, conn, nil
 }

@@ -2,12 +2,12 @@ package preshared
 
 import (
 	"context"
+	"errors"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	grpcAuth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
-	"github.com/pkg/errors"
 
 	"github.com/Permify/permify/internal/config"
 	base "github.com/Permify/permify/pkg/pb/base/v1"

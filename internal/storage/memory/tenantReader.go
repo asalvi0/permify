@@ -2,9 +2,9 @@ package memory
 
 import (
 	"context"
+	"errors"
 
 	"github.com/hashicorp/go-memdb"
-	"github.com/pkg/errors"
 
 	"github.com/Permify/permify/internal/storage"
 	"github.com/Permify/permify/internal/storage/memory/utils"

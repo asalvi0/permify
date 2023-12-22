@@ -2,9 +2,9 @@ package decorators
 
 import (
 	"context"
+	"errors"
 
 	"github.com/afex/hystrix-go/hystrix"
-	"github.com/pkg/errors"
 
 	"github.com/Permify/permify/internal/storage"
 	"github.com/Permify/permify/pkg/database"

@@ -1,13 +1,12 @@
 package utils
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
-
-	"github.com/pkg/errors"
 
 	"github.com/Masterminds/squirrel"
 
